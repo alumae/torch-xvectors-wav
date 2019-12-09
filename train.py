@@ -4,6 +4,7 @@ Runs a model on a single node across N-gpus.
 import os
 import sys
 from argparse import ArgumentParser
+import multiprocessing as mp
 
 import logging
 import numpy as np
@@ -33,8 +34,6 @@ def main(hparams):
     else:
         model = XVectorModel(hparams)
 
-
-    
         
 
     early_stop_callback = EarlyStopping(
@@ -52,7 +51,9 @@ def main(hparams):
         weights_summary='top',
         gpus=hparams.gpus,
         distributed_backend=hparams.distributed_backend,
-        early_stop_callback=early_stop_callback
+        early_stop_callback=early_stop_callback,
+        max_nb_epochs=hparams.max_num_epochs,
+        #train_percent_check=0.002,
     )
     
 
@@ -67,12 +68,12 @@ if __name__ == '__main__':
     # TRAINING ARGUMENTS
     # ------------------------
     # these are project-wide arguments
-    logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+    mp.set_start_method('fork')
 
     root_dir = os.path.dirname(os.path.realpath(__file__))
     parent_parser = ArgumentParser(add_help=False)
     
-
     # gpu args
     parent_parser.add_argument(
         '--gpus',
@@ -81,18 +82,24 @@ if __name__ == '__main__':
         help='how many gpus'
     )
     parent_parser.add_argument(
-        '--distributed_backend',
+        '--distributed-backend',
         type=str,
-        default='dp',
+        default='ddp',
         help='supports three options dp, ddp, ddp2'
     )
+    parent_parser.add_argument(
+        '--max-num-epochs', 
+        default=200, 
+        type=int, 
+        metavar='N',
+        help='max number of total epochs to run')
+
     parent_parser.add_argument(
         '--load-model-weights',
         type=str,
         default=None,
         help='Model log directory to restore'
     )
-
 
     # each LightningModule defines arguments relevant to it
     parser = XVectorModel.add_model_specific_args(parent_parser, root_dir)

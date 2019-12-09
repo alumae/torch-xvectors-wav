@@ -15,7 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 import pytorch_lightning as pl
 from pytorch_lightning.root_module.root_module import LightningModule
-from data import RandomChunkSubsetDatasetFactory
+from data import RandomChunkSubsetDatasetFactory, FastRandomChunkSubsetDatasetFactory, SegmentDataset
 from ngd import NGD
 
 
@@ -51,9 +51,9 @@ class XVectorModel(LightningModule):
 
         self.chunk_dataset_factory = RandomChunkSubsetDatasetFactory(hparams.datadir, 
             batch_size=hparams.batch_size, 
-            min_length=300, max_length=300)
+            min_length=200, max_length=400)
         self.feat_dim = self.chunk_dataset_factory.feat_dim
-        self.num_outputs = self.chunk_dataset_factory.num_outputs
+        self.num_outputs = self.chunk_dataset_factory.num_labels
 
 
         # if you specify an example input, the summary will show input/output for each layer
@@ -162,7 +162,8 @@ class XVectorModel(LightningModule):
         :param batch:
         :return:
         """
-        x, y = batch
+        x = batch["features"]
+        y = batch["label"]
         
         y_hat = self.forward(x)
 
@@ -241,7 +242,8 @@ class XVectorModel(LightningModule):
         else:
             raise NotImplementedError()
 
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+        #scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
         return [optimizer], [scheduler]
 
 
@@ -249,19 +251,25 @@ class XVectorModel(LightningModule):
     #@pl.data_loader -- we want it to be called every epoch
     def train_dataloader(self):
         dataset = self.chunk_dataset_factory.get_train_dataset(proportion=0.1)
-        dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        dist_sampler = None
+        num_workers = 4
+        if self.trainer.use_ddp:
+            dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         return torch.utils.data.DataLoader(dataset=dataset, sampler=dist_sampler,
             batch_size=None, 
-            num_workers=4)
+            num_workers=num_workers)
 
 
     @pl.data_loader
     def val_dataloader(self):
-        dataset = self.chunk_dataset_factory.get_valid_dataset(num_batches=3)
-        dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        dataset = SegmentDataset(datadir=self.hparams.dev_datadir, label2id=self.chunk_dataset_factory.label2id)
+        dist_sampler = None
+        if self.trainer.use_ddp:
+            dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         return torch.utils.data.DataLoader(dataset=dataset, sampler=dist_sampler,
-            batch_size=None, 
-            num_workers=1)
+            batch_size=1, #self.hparams.batch_size, 
+            collate_fn=dataset.collater,
+            num_workers=0)
 
 
     @pl.data_loader
@@ -290,9 +298,8 @@ class XVectorModel(LightningModule):
         parser.add_argument('--learning-rate', default=0.003, type=float)
 
         # data
-        parser.add_argument('--datadir', required=True, type=str)
-        parser.add_argument('--num-heldout', default=100, type=int)
-        
+        parser.add_argument('--datadir', required=True, type=str)       
+        parser.add_argument('--dev-datadir', required=True, type=str)
 
         # training params (opt)
         parser.add_argument('--optimizer-name', default='adamw', type=str)
