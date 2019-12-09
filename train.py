@@ -84,12 +84,12 @@ if __name__ == '__main__':
     parent_parser.add_argument(
         '--distributed-backend',
         type=str,
-        default='ddp',
+        default='dp',
         help='supports three options dp, ddp, ddp2'
     )
     parent_parser.add_argument(
         '--max-num-epochs', 
-        default=200, 
+        default=50, 
         type=int, 
         metavar='N',
         help='max number of total epochs to run')

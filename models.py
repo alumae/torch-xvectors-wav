@@ -16,7 +16,6 @@ from torch.utils.data.distributed import DistributedSampler
 import pytorch_lightning as pl
 from pytorch_lightning.root_module.root_module import LightningModule
 from data import RandomChunkSubsetDatasetFactory, FastRandomChunkSubsetDatasetFactory, SegmentDataset
-from ngd import NGD
 
 
 from egs import Nnet3EgsDataset
@@ -303,5 +302,5 @@ class XVectorModel(LightningModule):
 
         # training params (opt)
         parser.add_argument('--optimizer-name', default='adamw', type=str)
-        parser.add_argument('--batch-size', default=512, type=int)
+        parser.add_argument('--batch-size', default=256, type=int)
         return parser
