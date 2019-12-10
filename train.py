@@ -78,7 +78,7 @@ if __name__ == '__main__':
     parent_parser.add_argument(
         '--gpus',
         type=int,
-        default=2,
+        default=-1,
         help='how many gpus'
     )
     parent_parser.add_argument(
