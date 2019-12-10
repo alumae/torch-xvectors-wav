@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
 import pytorch_lightning as pl
-from pytorch_lightning.root_module.root_module import LightningModule
+from pytorch_lightning.core.lightning import LightningModule
 from data import RandomChunkSubsetDatasetFactory, FastRandomChunkSubsetDatasetFactory, SegmentDataset
 
 
