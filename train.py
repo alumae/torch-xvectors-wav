@@ -48,7 +48,7 @@ def main(hparams):
     # 2 INIT TRAINER
     # ------------------------
     trainer = Trainer(
-        weights_summary='top',
+        weights_summary=None,
         gpus=hparams.gpus,
         distributed_backend=hparams.distributed_backend,
         early_stop_callback=early_stop_callback,

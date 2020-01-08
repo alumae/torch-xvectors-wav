@@ -32,6 +32,40 @@ class StatisticalPooling(nn.Module):
         #breakpoint()
         return result
 
+
+class SelfAttentionPooling(nn.Module):
+
+    def __init__(self, dim, attention_dim, num_heads):
+        super(SelfAttentionPooling, self).__init__()
+        self.w1 = nn.Conv1d(dim, attention_dim, kernel_size=1, bias=None)
+        self.w2 = nn.Conv1d(attention_dim, num_heads, kernel_size=1, bias=None)
+        
+        #self.w1.weight.data.fill_(0.1)
+        #self.w2.weight.data.fill_(0.1)
+        self.penalty = None
+
+
+    def forward(self, x):        
+        # put head dimension in front
+        a = F.softmax(self.w2(F.relu(self.w1(x))), dim=-1).permute(1, 0, 2).unsqueeze(2)
+        mu = (x * a).sum(dim=-1, keepdim=True)
+        std = ((((x - mu)**2) * a).sum(dim=-1, keepdim=True) + 1e-12).sqrt()
+        result = torch.cat((mu, std), dim=2).permute(1, 0, 2, 3).reshape(x.shape[0], -1)
+
+        # Penalty term when multi-head attention is used.
+        
+        aa = a.squeeze(2).permute(1, 0, 2)
+        eye = torch.eye(aa.shape[1]).to(aa.device)
+        
+        self.penalty = (torch.bmm(aa,aa.permute(0,2,1)) - eye.unsqueeze(0).repeat(aa.shape[0], 1, 1) + 1e-7).norm(dim=(1,2)).mean()
+
+        return result
+
+    def get_last_penalty(self):
+        return self.penalty
+
+
+
 class XVectorModel(LightningModule):
     """
     Sample model to show how to define a template
@@ -56,7 +90,7 @@ class XVectorModel(LightningModule):
 
 
         # if you specify an example input, the summary will show input/output for each layer
-        self.example_input_array = torch.rand((self.batch_size, self.feat_dim, 300))
+        #self.example_input_array = torch.rand((self.batch_size, self.feat_dim, 300))
 
         # build model
         self.__build_model()
@@ -88,7 +122,12 @@ class XVectorModel(LightningModule):
             layers.append(nn.ReLU(inplace=True))
             current_input_dim = hidden_dim
 
-        layers.append(StatisticalPooling())
+        if self.hparams.use_attention:
+            self.attention_pooling_layer = SelfAttentionPooling(dim=hidden_dim, attention_dim=self.hparams.attention_dim, num_heads=self.hparams.num_attention_heads)
+            layers.append(self.attention_pooling_layer)
+            current_input_dim = hidden_dim * self.hparams.num_attention_heads
+        else:
+            layers.append(StatisticalPooling())
 
         layers.append(nn.Linear(current_input_dim * 2, self.hparams.hidden_dim))
         layers.append(nn.BatchNorm1d(self.hparams.hidden_dim, momentum=bn_momentum))
@@ -120,6 +159,7 @@ class XVectorModel(LightningModule):
         :param x:
         :return:
         """
+        #breakpoint()
         return self.model(x)
 
     def loss(self, labels, logits):
@@ -139,11 +179,18 @@ class XVectorModel(LightningModule):
 
         # calculate loss
         loss_val = self.loss(y, y_hat)
-        #breakpoint()
-
         # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
         if self.trainer.use_dp or self.trainer.use_ddp2:
             loss_val = loss_val.unsqueeze(0)
+
+        attention_diversity_penalty = None
+        if self.hparams.use_attention and self.hparams.num_attention_heads > 1:
+            attention_diversity_penalty = self.hparams.attention_diversity_penalty_lambda * self.attention_pooling_layer.get_last_penalty()
+            if self.trainer.use_dp or self.trainer.use_ddp2:
+                attention_diversity_penalty = attention_diversity_penalty.unsqueeze(0)
+            loss_val += attention_diversity_penalty
+        #breakpoint()
+
 
         tqdm_dict = {'train_loss': loss_val}
         output = OrderedDict({
@@ -151,6 +198,8 @@ class XVectorModel(LightningModule):
             'progress_bar': tqdm_dict,
             'log': tqdm_dict
         })
+        if attention_diversity_penalty is not None:
+            tqdm_dict["att_div_pen"] = attention_diversity_penalty
 
         # can also return just a scalar instead of a dict (return loss_val)
         return output
@@ -295,6 +344,12 @@ class XVectorModel(LightningModule):
         parser.add_argument('--hidden-dim', default=512, type=int)
         parser.add_argument('--pre-pooling-hidden-dim', default=1500, type=int)
         parser.add_argument('--learning-rate', default=0.003, type=float)
+
+        # use attention instead of stats pooling?
+        parser.add_argument('--use-attention', default=False, type=bool)
+        parser.add_argument('--num-attention-heads', default=2, type=int)
+        parser.add_argument('--attention-dim', default=128, type=int)
+        parser.add_argument('--attention-diversity-penalty-lambda', default=0.01, type=float)
 
         # data
         parser.add_argument('--datadir', required=True, type=str)       
