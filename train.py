@@ -52,7 +52,7 @@ def main(hparams):
         gpus=hparams.gpus,
         distributed_backend=hparams.distributed_backend,
         early_stop_callback=early_stop_callback,
-        max_nb_epochs=hparams.max_num_epochs,
+        max_epochs=hparams.max_num_epochs,
         #train_percent_check=0.002,
     )
     
@@ -89,7 +89,7 @@ if __name__ == '__main__':
     )
     parent_parser.add_argument(
         '--max-num-epochs', 
-        default=50, 
+        default=100, 
         type=int, 
         metavar='N',
         help='max number of total epochs to run')

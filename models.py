@@ -5,6 +5,8 @@ import os
 import logging
 from argparse import ArgumentParser
 from collections import OrderedDict
+import random
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -13,13 +15,23 @@ from torch import optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 
+import torchaudio
+import torchaudio.transforms
+
 import pytorch_lightning as pl
 from pytorch_lightning.core.lightning import LightningModule
-from data import RandomChunkSubsetDatasetFactory, FastRandomChunkSubsetDatasetFactory, SegmentDataset
+from data import RandomWavChunkSubsetDatasetFactory, WavSegmentDataset
+import transforms
 
 
 from egs import Nnet3EgsDataset
 
+EPSILON = torch.tensor(torch.finfo(torch.float).eps)
+
+class CMN(nn.Module):
+
+    def forward(self, x):
+        return x - torch.mean(x, dim=2).unsqueeze(2)
 
 
 class StatisticalPooling(nn.Module):
@@ -55,7 +67,7 @@ class SelfAttentionPooling(nn.Module):
         # Penalty term when multi-head attention is used.
         
         aa = a.squeeze(2).permute(1, 0, 2)
-        eye = torch.eye(aa.shape[1]).to(aa.device)
+        eye = torch.eye(aa.shape[1], device=aa.device)
         
         self.penalty = (torch.bmm(aa,aa.permute(0,2,1)) - eye.unsqueeze(0).repeat(aa.shape[0], 1, 1) + 1e-7).norm(dim=(1,2)).mean()
 
@@ -82,11 +94,20 @@ class XVectorModel(LightningModule):
 
         self.batch_size = hparams.batch_size
 
-        self.chunk_dataset_factory = RandomChunkSubsetDatasetFactory(hparams.datadir, 
+        self.chunk_dataset_factory = RandomWavChunkSubsetDatasetFactory(hparams.datadir, 
             batch_size=hparams.batch_size, 
-            min_length=200, max_length=400)
-        self.feat_dim = self.chunk_dataset_factory.feat_dim
+            min_length=2.0, max_length=4.0,
+            label_file=hparams.utt2class)
+
         self.num_outputs = self.chunk_dataset_factory.num_labels
+
+        self.speed_perturbation = transforms.SpeedPerturbation()
+
+        self.transforms = [
+            transforms.Reverberate(rir_list_filename="local/real_and_sim_rirs.wavs.txt"),
+            transforms.AddNoise(noise_list_filename="local/musan.100.wavs.txt"),
+            transforms.WhiteNoise(),
+        ]
 
 
         # if you specify an example input, the summary will show input/output for each layer
@@ -103,20 +124,33 @@ class XVectorModel(LightningModule):
         Layout model
         :return:
         """
+        feature_extractor_layers = []
+        feature_extractor_layers.append(torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.chunk_dataset_factory.sample_rate,
+            win_length=int(self.chunk_dataset_factory.sample_rate * 0.025),
+            hop_length=int(self.chunk_dataset_factory.sample_rate * 0.01),
+            f_min=20.0,
+            n_mels=self.hparams.num_fbanks))
+        
+        feature_extractor_layers.append(torchaudio.transforms.AmplitudeToDB('power', 80.0))
+
+        feature_extractor_layers.append(CMN())
+        self.feature_extractor = nn.Sequential(*feature_extractor_layers)
+
+        layers = []
+        
+
         bn_momentum = 0.05
         conv_kernel_sizes = [int(i.strip()) for i in self.hparams.conv_kernels.split(",")]
         conv_kernel_dilations = [int(i.strip()) for i in self.hparams.conv_dilations.split(",")]
         assert len(conv_kernel_sizes) == len(conv_kernel_dilations)
-        layers = []
-        current_input_dim = self.feat_dim
+        current_input_dim = self.hparams.num_fbanks
         for i in range(len(conv_kernel_sizes)):
             if i < len(conv_kernel_sizes) - 1:
                 hidden_dim = self.hparams.hidden_dim
             else:
                 hidden_dim = self.hparams.pre_pooling_hidden_dim
             conv_layer = nn.Conv1d(current_input_dim, hidden_dim, conv_kernel_sizes[i], dilation=conv_kernel_dilations[i])
-            #conv_layer.bias.data.fill_(0.1)
-            #conv_layer.weight.data.normal_(0, 0.1)
             layers.append(conv_layer)            
             layers.append(nn.BatchNorm1d(hidden_dim, momentum=bn_momentum))
             layers.append(nn.ReLU(inplace=True))
@@ -126,6 +160,8 @@ class XVectorModel(LightningModule):
             self.attention_pooling_layer = SelfAttentionPooling(dim=hidden_dim, attention_dim=self.hparams.attention_dim, num_heads=self.hparams.num_attention_heads)
             layers.append(self.attention_pooling_layer)
             current_input_dim = hidden_dim * self.hparams.num_attention_heads
+        elif self.hparams.use_gating:
+            pass
         else:
             layers.append(StatisticalPooling())
 
@@ -148,8 +184,8 @@ class XVectorModel(LightningModule):
         self.model = nn.Sequential(*layers)
         
         print(self.model)
-        from torchsummary import summary
-        summary(self.model, input_size=(self.feat_dim, 300), device="cpu")
+        #from torchsummary import summary
+        #summary(self.model, input_size=(self.feat_dim, 300), device="cpu")
     # ---------------------
     # TRAINING
     # ---------------------
@@ -162,9 +198,15 @@ class XVectorModel(LightningModule):
         #breakpoint()
         return self.model(x)
 
+    def wav_to_features(self, x):
+        with torch.no_grad():
+            return self.feature_extractor(x)
+
     def loss(self, labels, logits):
         nll = F.nll_loss(logits, labels)
         return nll
+
+
 
     def training_step(self, batch, batch_idx):
         """
@@ -174,14 +216,41 @@ class XVectorModel(LightningModule):
         """
         # forward pass
         x, y = batch
-        
-        y_hat = self.forward(x)
+        with torch.no_grad():
+            if random.random() < self.hparams.speed_perturbation_probability:
+                x = self.speed_perturbation(x).to(x.device)
+
+        x_aug_1 = torch.zeros_like(x)
+        x_aug_2 = torch.zeros_like(x)        
+        with torch.no_grad():
+            for i in range(len(x)):
+                x_aug_1[i] = transforms.augment_and_mix(self.transforms, x[i])
+                x_aug_2[i] = transforms.augment_and_mix(self.transforms, x[i])
+
+
+        y_hat = self.forward(self.wav_to_features(x))
 
         # calculate loss
         loss_val = self.loss(y, y_hat)
         # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
         if self.trainer.use_dp or self.trainer.use_ddp2:
             loss_val = loss_val.unsqueeze(0)
+
+        p_x = y_hat.exp()
+        p_aug_1 = self.forward(self.wav_to_features(x_aug_1)).exp()
+        p_aug_2 = self.forward(self.wav_to_features(x_aug_2)).exp()
+
+        log_p_mixture = torch.clamp((p_x + p_aug_1 + p_aug_2) / 3., 1e-7, 1).log()
+        
+        aug_mix_loss = 12 * (F.kl_div(log_p_mixture, p_x, reduction='batchmean') +
+                    F.kl_div(log_p_mixture, p_aug_1, reduction='batchmean') +
+                    F.kl_div(log_p_mixture, p_aug_2, reduction='batchmean')) / 3.
+        if self.trainer.use_dp or self.trainer.use_ddp2:
+            aug_mix_loss = aug_mix_loss.unsqueeze(0)
+
+        loss_val += aug_mix_loss
+
+            
 
         attention_diversity_penalty = None
         if self.hparams.use_attention and self.hparams.num_attention_heads > 1:
@@ -201,6 +270,8 @@ class XVectorModel(LightningModule):
         if attention_diversity_penalty is not None:
             tqdm_dict["att_div_pen"] = attention_diversity_penalty
 
+        tqdm_dict["aug_mix_loss"] = aug_mix_loss
+
         # can also return just a scalar instead of a dict (return loss_val)
         return output
 
@@ -210,10 +281,10 @@ class XVectorModel(LightningModule):
         :param batch:
         :return:
         """
-        x = batch["features"]
+        x = batch["wavs"]
         y = batch["label"]
         
-        y_hat = self.forward(x)
+        y_hat = self.forward(self.wav_to_features(x))
 
         loss_val = self.loss(y, y_hat)
 
@@ -291,7 +362,7 @@ class XVectorModel(LightningModule):
             raise NotImplementedError()
 
         #scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
         return [optimizer], [scheduler]
 
 
@@ -310,7 +381,7 @@ class XVectorModel(LightningModule):
 
     @pl.data_loader
     def val_dataloader(self):
-        dataset = SegmentDataset(datadir=self.hparams.dev_datadir, label2id=self.chunk_dataset_factory.label2id)
+        dataset = WavSegmentDataset(datadir=self.hparams.dev_datadir, label2id=self.chunk_dataset_factory.label2id, label_file=self.hparams.utt2class)
         dist_sampler = None
         if self.trainer.use_ddp:
             dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
@@ -339,6 +410,8 @@ class XVectorModel(LightningModule):
 
         #parser.add_argument('--conv-kernels', default="5,1,3,1,3,1,3,1,1")
         #parser.add_argument('--conv-dilations', default="1,1,2,1,3,1,4,1,1")
+        parser.add_argument('--num-fbanks', default=30, type=int)
+
         parser.add_argument('--conv-kernels', default="5,3,3,1,1")
         parser.add_argument('--conv-dilations', default="1,2,3,1,1")
         parser.add_argument('--hidden-dim', default=512, type=int)
@@ -351,9 +424,15 @@ class XVectorModel(LightningModule):
         parser.add_argument('--attention-dim', default=128, type=int)
         parser.add_argument('--attention-diversity-penalty-lambda', default=0.01, type=float)
 
+        # use a dedicated gating branch before pooling
+        parser.add_argument('--use-attention', default=False, type=bool)
+
+        parser.add_argument('--speed-perturbation-probability', default=0.5, type=float)
+
         # data
         parser.add_argument('--datadir', required=True, type=str)       
         parser.add_argument('--dev-datadir', required=True, type=str)
+        parser.add_argument('--utt2class', default="utt2lang", type=str)
 
         # training params (opt)
         parser.add_argument('--optimizer-name', default='adamw', type=str)
