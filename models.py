@@ -18,20 +18,123 @@ from torch.utils.data.distributed import DistributedSampler
 import torchaudio
 import torchaudio.transforms
 
+import torchvision.models
+
 import pytorch_lightning as pl
 from pytorch_lightning.core.lightning import LightningModule
-from data import RandomWavChunkSubsetDatasetFactory, WavSegmentDataset
+from data import RandomWavChunkSubsetDatasetFactory, WavSegmentDataset, DiskWavDataset
 import transforms
 
+from kaldiio import WriteHelper
 
-from egs import Nnet3EgsDataset
 
 EPSILON = torch.tensor(torch.finfo(torch.float).eps)
+
+def nll_loss_with_label_smoothing(inputs, target, smooth_eps=None):
+    assert inputs.shape[0] == target.shape[0]
+    smooth_eps = smooth_eps or 0
+
+    if smooth_eps < EPSILON:
+        return F.nll_loss(inputs, target)
+    #breakpoint()
+
+    num_classes = inputs.size(-1)
+
+    eps_sum = smooth_eps / num_classes
+    eps_nll = 1. - eps_sum - smooth_eps
+    
+    likelihood = inputs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+    loss = -(eps_nll * likelihood + eps_sum * inputs.sum(-1)).mean(0)
+
+    return loss
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class SEBasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None,
+                 *, reduction=16):
+        super(SEBasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes, 1)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.se = SELayer(planes, reduction)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.se(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+class GatingModel(nn.Module):
+
+    def __init__(self, input_dim):
+        super(GatingModel, self).__init__()
+        self.batchnorm = nn.BatchNorm1d(input_dim)
+        self.rnn = nn.GRU(input_dim, 100, batch_first=True, bidirectional=True, num_layers=1)
+        self.fc = nn.Linear(200, 1)
+
+    def forward(self, x):
+        x = self.batchnorm(x).permute(0, 2, 1).contiguous()
+        x, _ = self.rnn(x)
+        result = F.sigmoid(self.fc(x))    
+        return result.reshape(x.shape[0], -1)
+
 
 class CMN(nn.Module):
 
     def forward(self, x):
         return x - torch.mean(x, dim=2).unsqueeze(2)
+
+
+class WeightedStatisticalPooling(nn.Module):
+
+    def forward(self, x, weights):
+        # x is 3-D with axis [B, feats, T]
+        weights_sum = weights.sum(dim=-1).view(weights.shape[0], 1, 1)
+        mu = (x * weights.unsqueeze(1)).sum(dim=-1, keepdim=True) / weights_sum
+        std = ((((x - mu)**2) * weights.unsqueeze(1)).sum(dim=-1, keepdim=True) / weights_sum  + EPSILON).sqrt()
+        result = torch.cat((mu, std), dim=1).squeeze(-1)
+
+        return result
 
 
 class StatisticalPooling(nn.Module):
@@ -59,9 +162,9 @@ class SelfAttentionPooling(nn.Module):
 
     def forward(self, x):        
         # put head dimension in front
-        a = F.softmax(self.w2(F.relu(self.w1(x))), dim=-1).permute(1, 0, 2).unsqueeze(2)
+        a =  torch.clamp(F.softmax(self.w2(F.relu(self.w1(x))), dim=-1), 1e-7, 1).permute(1, 0, 2).unsqueeze(2)
         mu = (x * a).sum(dim=-1, keepdim=True)
-        std = ((((x - mu)**2) * a).sum(dim=-1, keepdim=True) + 1e-12).sqrt()
+        std = ((((x - mu)**2) * a).sum(dim=-1, keepdim=True) + 1e-7).sqrt()
         result = torch.cat((mu, std), dim=2).permute(1, 0, 2, 3).reshape(x.shape[0], -1)
 
         # Penalty term when multi-head attention is used.
@@ -109,6 +212,8 @@ class XVectorModel(LightningModule):
             transforms.WhiteNoise(),
         ]
 
+        # For dumping x-vectors
+        self.write_helper = None
 
         # if you specify an example input, the summary will show input/output for each layer
         #self.example_input_array = torch.rand((self.batch_size, self.feat_dim, 300))
@@ -124,6 +229,8 @@ class XVectorModel(LightningModule):
         Layout model
         :return:
         """
+        bn_momentum = 0.05
+
         feature_extractor_layers = []
         feature_extractor_layers.append(torchaudio.transforms.MelSpectrogram(
             sample_rate=self.chunk_dataset_factory.sample_rate,
@@ -137,53 +244,74 @@ class XVectorModel(LightningModule):
         feature_extractor_layers.append(CMN())
         self.feature_extractor = nn.Sequential(*feature_extractor_layers)
 
-        layers = []
-        
+        if (self.hparams.use_resnet):
+            self.pre_resnet =  nn.Sequential(
+                nn.Conv2d(1, 64, kernel_size=7, stride=1, padding=3, bias=False),
+                nn.BatchNorm2d(64, momentum=bn_momentum),
+                nn.ReLU(inplace=True))
 
-        bn_momentum = 0.05
-        conv_kernel_sizes = [int(i.strip()) for i in self.hparams.conv_kernels.split(",")]
-        conv_kernel_dilations = [int(i.strip()) for i in self.hparams.conv_dilations.split(",")]
-        assert len(conv_kernel_sizes) == len(conv_kernel_dilations)
-        current_input_dim = self.hparams.num_fbanks
-        for i in range(len(conv_kernel_sizes)):
-            if i < len(conv_kernel_sizes) - 1:
-                hidden_dim = self.hparams.hidden_dim
-            else:
-                hidden_dim = self.hparams.pre_pooling_hidden_dim
-            conv_layer = nn.Conv1d(current_input_dim, hidden_dim, conv_kernel_sizes[i], dilation=conv_kernel_dilations[i])
-            layers.append(conv_layer)            
-            layers.append(nn.BatchNorm1d(hidden_dim, momentum=bn_momentum))
-            layers.append(nn.ReLU(inplace=True))
-            current_input_dim = hidden_dim
+            self.resnet = torchvision.models.ResNet(SEBasicBlock, [2, 2, 2, 2])
+            # FIXME: kernel_size depends on num_fbanks
+            self.post_resnet =  nn.Sequential(
+                nn.Conv2d(512, self.hparams.pre_pooling_hidden_dim, kernel_size=(4,1),  bias=False),
+                nn.BatchNorm2d(self.hparams.pre_pooling_hidden_dim, momentum=bn_momentum),
+                nn.ReLU(inplace=True))
+            hidden_dim = 512
+
+        else:           
+            pre_pooling_layers = []
+            conv_kernel_sizes = [int(i.strip()) for i in self.hparams.conv_kernels.split(",")]
+            conv_kernel_dilations = [int(i.strip()) for i in self.hparams.conv_dilations.split(",")]
+            assert len(conv_kernel_sizes) == len(conv_kernel_dilations)
+            current_input_dim = self.hparams.num_fbanks
+            for i in range(len(conv_kernel_sizes)):
+                if i < len(conv_kernel_sizes) - 1:
+                    hidden_dim = self.hparams.hidden_dim
+                else:
+                    hidden_dim = self.hparams.pre_pooling_hidden_dim
+                conv_layer = nn.Conv1d(current_input_dim, hidden_dim, conv_kernel_sizes[i], 
+                                    dilation=conv_kernel_dilations[i], 
+                                    padding=(conv_kernel_sizes[i]-1) // 2 * conv_kernel_dilations[i])
+                pre_pooling_layers.append(conv_layer)            
+                pre_pooling_layers.append(nn.BatchNorm1d(hidden_dim, momentum=bn_momentum))
+                pre_pooling_layers.append(nn.ReLU(inplace=True))
+                current_input_dim = hidden_dim
+            self.pre_pooling_layers = nn.Sequential(*pre_pooling_layers)
+
 
         if self.hparams.use_attention:
             self.attention_pooling_layer = SelfAttentionPooling(dim=hidden_dim, attention_dim=self.hparams.attention_dim, num_heads=self.hparams.num_attention_heads)
-            layers.append(self.attention_pooling_layer)
+            self.pooling_layer = self.attention_pooling_layer
             current_input_dim = hidden_dim * self.hparams.num_attention_heads
-        elif self.hparams.use_gating:
-            pass
+        elif self.hparams.use_gating_branch:
+            self.gating_model = GatingModel(self.hparams.num_fbanks)
+            self.pooling_layer = WeightedStatisticalPooling()
         else:
-            layers.append(StatisticalPooling())
+            self.pooling_layer = StatisticalPooling()
+        
+        post_pooling_layers = []
 
-        layers.append(nn.Linear(current_input_dim * 2, self.hparams.hidden_dim))
-        layers.append(nn.BatchNorm1d(self.hparams.hidden_dim, momentum=bn_momentum))
-        layers.append(nn.ReLU(inplace=True))
+        post_pooling_layers.append(nn.Linear(current_input_dim * 2, self.hparams.hidden_dim))
+        post_pooling_layers.append(nn.BatchNorm1d(self.hparams.hidden_dim, momentum=bn_momentum))
+        post_pooling_layers.append(nn.ReLU(inplace=True))
 
-        layers.append(nn.Linear(self.hparams.hidden_dim, self.hparams.hidden_dim))
-        layers.append(nn.BatchNorm1d(self.hparams.hidden_dim, momentum=bn_momentum))
-        layers.append(nn.ReLU(inplace=True))
+        post_pooling_layers.append(nn.Linear(self.hparams.hidden_dim, self.hparams.hidden_dim))
+        post_pooling_layers.append(nn.BatchNorm1d(self.hparams.hidden_dim, momentum=bn_momentum))
+        post_pooling_layers.append(nn.ReLU(inplace=True))
 
         linear = nn.Linear(self.hparams.hidden_dim, self.num_outputs)
         linear.bias.data.fill_(0.0)
         linear.weight.data.fill_(0.0)
 
-        layers.append(linear)
+        post_pooling_layers.append(linear)
 
-        layers.append(nn.LogSoftmax(dim=1))
+        post_pooling_layers.append(nn.LogSoftmax(dim=1))
 
-        self.model = nn.Sequential(*layers)
         
-        print(self.model)
+        self.post_pooling_layers = nn.Sequential(*post_pooling_layers)
+
+        
+        #print(self.model)
         #from torchsummary import summary
         #summary(self.model, input_size=(self.feat_dim, 300), device="cpu")
     # ---------------------
@@ -195,17 +323,42 @@ class XVectorModel(LightningModule):
         :param x:
         :return:
         """
-        #breakpoint()
-        return self.model(x)
+        pooling_output = self._forward_until_pooling(x)
+        return self.post_pooling_layers(pooling_output)
+
+    def _forward_until_pooling(self, x):
+        if self.hparams.use_resnet:
+            x = x.unsqueeze(1)
+            x = self.pre_resnet(x)            
+            x = self.resnet.layer1(x)
+            x = self.resnet.layer2(x)
+            x = self.resnet.layer3(x)
+            x = self.resnet.layer4(x)
+            x = self.post_resnet(x)
+            pre_pooling_output = x.view(x.shape[0], -1, x.shape[-1])
+        else:
+            pre_pooling_output = self.pre_pooling_layers(x)
+
+        if self.hparams.use_gating_branch:
+            self.gating_model.rnn.flatten_parameters()
+            gating_output = self.gating_model(x)
+            #breakpoint()
+            pooling_output = self.pooling_layer(pre_pooling_output, gating_output)
+            return pooling_output
+        else:
+            return self.pooling_layer(pre_pooling_output)
 
     def wav_to_features(self, x):
         with torch.no_grad():
             return self.feature_extractor(x)
 
-    def loss(self, labels, logits):
-        nll = F.nll_loss(logits, labels)
+    def loss(self, labels, logits, smooth_eps=0.0):
+        nll = nll_loss_with_label_smoothing(logits, labels, smooth_eps)
         return nll
 
+    def extract_xvectors(self, x):
+        pooling_output = self._forward_until_pooling(x)
+        return self.post_pooling_layers[0](pooling_output)
 
 
     def training_step(self, batch, batch_idx):
@@ -219,48 +372,61 @@ class XVectorModel(LightningModule):
         with torch.no_grad():
             if random.random() < self.hparams.speed_perturbation_probability:
                 x = self.speed_perturbation(x).to(x.device)
-
-        x_aug_1 = torch.zeros_like(x)
-        x_aug_2 = torch.zeros_like(x)        
-        with torch.no_grad():
-            for i in range(len(x)):
-                x_aug_1[i] = transforms.augment_and_mix(self.transforms, x[i])
-                x_aug_2[i] = transforms.augment_and_mix(self.transforms, x[i])
-
+        
+        if self.hparams.augmix_lambda > EPSILON:
+            x_aug_1 = torch.zeros_like(x)
+            x_aug_2 = torch.zeros_like(x)        
+            with torch.no_grad():
+                for i in range(len(x)):
+                    x_aug_1[i] = transforms.augment_and_mix(self.transforms, x[i])
+                    x_aug_2[i] = transforms.augment_and_mix(self.transforms, x[i])
+        else:
+            with torch.no_grad():
+                for i in range(len(x)):
+                    if self.hparams.use_simple_augment:
+                        x[i] = transforms.random_augment(self.transforms, x[i])
+                    else:    
+                        x[i] = transforms.augment_and_mix(self.transforms, x[i])
 
         y_hat = self.forward(self.wav_to_features(x))
 
         # calculate loss
-        loss_val = self.loss(y, y_hat)
+        loss_val = self.loss(y, y_hat, smooth_eps=self.hparams.label_smoothing)
+
+        if torch.isnan(loss_val).any():
+            logging.warn("NaN in loss detected. Setting those loss values to zero")
+            breakpoint()
+            loss_val = loss_val.masked_fill(torch.isnan(loss_val), 0)
+            
+
         # in DP mode (default) make sure if result is scalar, there's another dim in the beginning
         if self.trainer.use_dp or self.trainer.use_ddp2:
             loss_val = loss_val.unsqueeze(0)
 
-        p_x = y_hat.exp()
-        p_aug_1 = self.forward(self.wav_to_features(x_aug_1)).exp()
-        p_aug_2 = self.forward(self.wav_to_features(x_aug_2)).exp()
+        if self.hparams.augmix_lambda > EPSILON:
+            p_x = y_hat.exp()
+            p_aug_1 = self.forward(self.wav_to_features(x_aug_1)).exp()
+            p_aug_2 = self.forward(self.wav_to_features(x_aug_2)).exp()
 
-        log_p_mixture = torch.clamp((p_x + p_aug_1 + p_aug_2) / 3., 1e-7, 1).log()
-        
-        aug_mix_loss = 12 * (F.kl_div(log_p_mixture, p_x, reduction='batchmean') +
-                    F.kl_div(log_p_mixture, p_aug_1, reduction='batchmean') +
-                    F.kl_div(log_p_mixture, p_aug_2, reduction='batchmean')) / 3.
-        if self.trainer.use_dp or self.trainer.use_ddp2:
-            aug_mix_loss = aug_mix_loss.unsqueeze(0)
+            log_p_mixture = torch.clamp((p_x + p_aug_1 + p_aug_2) / 3., 1e-7, 1).log()
+            
+            aug_mix_loss = self.hparams.augmix_lambda * (F.kl_div(log_p_mixture, p_x, reduction='batchmean') +
+                        F.kl_div(log_p_mixture, p_aug_1, reduction='batchmean') +
+                        F.kl_div(log_p_mixture, p_aug_2, reduction='batchmean')) / 3.
+            if self.trainer.use_dp or self.trainer.use_ddp2:
+                aug_mix_loss = aug_mix_loss.unsqueeze(0)
 
-        loss_val += aug_mix_loss
+            loss_val += aug_mix_loss
 
             
 
         attention_diversity_penalty = None
-        if self.hparams.use_attention and self.hparams.num_attention_heads > 1:
+        if self.hparams.use_attention and self.hparams.num_attention_heads > 1 and self.hparams.attention_diversity_penalty_lambda > EPSILON:
             attention_diversity_penalty = self.hparams.attention_diversity_penalty_lambda * self.attention_pooling_layer.get_last_penalty()
             if self.trainer.use_dp or self.trainer.use_ddp2:
                 attention_diversity_penalty = attention_diversity_penalty.unsqueeze(0)
             loss_val += attention_diversity_penalty
-        #breakpoint()
-
-
+        
         tqdm_dict = {'train_loss': loss_val}
         output = OrderedDict({
             'loss': loss_val,
@@ -269,10 +435,11 @@ class XVectorModel(LightningModule):
         })
         if attention_diversity_penalty is not None:
             tqdm_dict["att_div_pen"] = attention_diversity_penalty
-
-        tqdm_dict["aug_mix_loss"] = aug_mix_loss
+        if self.hparams.augmix_lambda > EPSILON:
+           tqdm_dict["aug_mix_loss"] = aug_mix_loss
 
         # can also return just a scalar instead of a dict (return loss_val)
+        #breakpoint()
         return output
 
     def validation_step(self, batch, batch_idx):
@@ -342,6 +509,35 @@ class XVectorModel(LightningModule):
         result = {'progress_bar': tqdm_dict, 'log': tqdm_dict, 'val_loss': val_loss_mean}
         return result
 
+    def test_step(self, batch, batch_idx):
+        x = batch["wavs"]
+        
+        if self.hparams.augmix_xvectors:
+            for i in range(len(x)):
+                if self.hparams.use_simple_augment:
+                    x[i] = transforms.random_augment(self.transforms, x[i])
+                else:    
+                    x[i] = transforms.augment_and_mix(self.transforms, x[i])
+
+        xvectors = self.extract_xvectors(self.wav_to_features(x))
+
+        if self.write_helper is None and self.hparams.dump_xvectors_dir is not None:            
+            self.write_helper = WriteHelper(f'ark,scp:{self.hparams.dump_xvectors_dir}/xvector.ark,{self.hparams.dump_xvectors_dir}/xvector.scp')
+        if self.write_helper:
+            for i in range(len(xvectors)):
+                self.write_helper(batch["key"][i], xvectors[i].cpu().numpy())
+
+
+        output = OrderedDict({
+        })
+
+        # can also return just a scalar instead of a dict (return loss_val)
+        return output
+
+    def test_end(self, outputs):
+        return {}
+
+
     # ---------------------
     # TRAINING SETUP
     # ---------------------
@@ -362,7 +558,7 @@ class XVectorModel(LightningModule):
             raise NotImplementedError()
 
         #scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
         return [optimizer], [scheduler]
 
 
@@ -371,7 +567,7 @@ class XVectorModel(LightningModule):
     def train_dataloader(self):
         dataset = self.chunk_dataset_factory.get_train_dataset(proportion=0.1)
         dist_sampler = None
-        num_workers = 4
+        num_workers = 8
         if self.trainer.use_ddp:
             dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         return torch.utils.data.DataLoader(dataset=dataset, sampler=dist_sampler,
@@ -391,9 +587,22 @@ class XVectorModel(LightningModule):
             num_workers=0)
 
 
+
     @pl.data_loader
     def test_dataloader(self):
-        return None
+        if self.hparams.extract_xvectors_datadir is not None:
+            dataset = DiskWavDataset(datadir=self.hparams.extract_xvectors_datadir, label2id=None, label_file=self.hparams.utt2class)
+            dist_sampler = None
+            if self.trainer.use_ddp:
+                dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+            dataloader = torch.utils.data.DataLoader(dataset=dataset, sampler=dist_sampler,
+                batch_size=1, #self.hparams.batch_size, 
+                collate_fn=dataset.collater,
+                num_workers=2)
+            return dataloader
+        else:
+            return None
+
 
     @staticmethod
     def add_model_specific_args(parent_parser, root_dir):  # pragma: no cover
@@ -408,10 +617,9 @@ class XVectorModel(LightningModule):
         # param overwrites
         # parser.set_defaults(gradient_clip_val=5.0)
 
+        parser.add_argument('--num-fbanks', default=30, type=int)
         #parser.add_argument('--conv-kernels', default="5,1,3,1,3,1,3,1,1")
         #parser.add_argument('--conv-dilations', default="1,1,2,1,3,1,4,1,1")
-        parser.add_argument('--num-fbanks', default=30, type=int)
-
         parser.add_argument('--conv-kernels', default="5,3,3,1,1")
         parser.add_argument('--conv-dilations', default="1,2,3,1,1")
         parser.add_argument('--hidden-dim', default=512, type=int)
@@ -424,10 +632,16 @@ class XVectorModel(LightningModule):
         parser.add_argument('--attention-dim', default=128, type=int)
         parser.add_argument('--attention-diversity-penalty-lambda', default=0.01, type=float)
 
+        parser.add_argument('--augmix-lambda', default=12.0, type=float)
+
         # use a dedicated gating branch before pooling
-        parser.add_argument('--use-attention', default=False, type=bool)
+        parser.add_argument('--use-gating-branch', default=False, type=bool)
+
+        parser.add_argument('--use-resnet', default=False, type=bool)
 
         parser.add_argument('--speed-perturbation-probability', default=0.5, type=float)
+
+        parser.add_argument('--use-simple-augment', default=False, type=bool)
 
         # data
         parser.add_argument('--datadir', required=True, type=str)       
@@ -437,4 +651,28 @@ class XVectorModel(LightningModule):
         # training params (opt)
         parser.add_argument('--optimizer-name', default='adamw', type=str)
         parser.add_argument('--batch-size', default=256, type=int)
+
+        parser.add_argument('--label-smoothing', default=0.0, type=float)
+
+        parser.add_argument(
+            '--extract-xvectors-datadir',
+            type=str,
+            default=None,
+            help='Extract x-vectors for the data in the datadir'
+        )
+        parser.add_argument(
+            '--augmix-xvectors',
+            type=bool,
+            default=False,
+            help='Apply augmix to input data when extracting x-vectors'
+        )
+
+
+        parser.add_argument(
+            '--dump-xvectors-dir',
+            type=str,
+            default=None,
+            help='Directory to store xvectors in'
+        )
+
         return parser

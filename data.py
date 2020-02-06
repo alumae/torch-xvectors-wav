@@ -51,7 +51,7 @@ class WavChunkDataset(torch.utils.data.Dataset):
             while True:
                 label = random.choice(self.outer.labels)
                 if self.is_train:
-                    utts = train_label2utt_filtered[label]
+                    utts = train_label2utt_filtered.get(label, [])
                 else:
                     utts = list(filter(
                         lambda utt: self.outer.utt2dur[utt] >= chunk_length, self.outer.valid_label2utt[label]))
@@ -230,6 +230,74 @@ class WavSegmentDataset(torch.utils.data.Dataset):
         key = self.keys[index]
         return {"key": key, 
                 "wavs": self.wavs[key],
+                "label": self.utt2label[key]}
+
+    def collater(self, samples):
+        """Merge a list of wavs to form a mini-batch.
+
+        Args:
+            samples (List[dict]): wavs to collate
+
+        Returns:
+            dict: a mini-batch suitable for forwarding with a Model
+        """
+        if len(samples) == 0:
+            return {}
+
+        wavs = [s["wavs"] for s in samples]
+
+        len_max = max(len(wav) for wav in wavs)
+        collated_wavs = wavs[0].new(
+            len(wavs), len_max).fill_(0.0)
+
+        for i, v in enumerate(wavs):
+            collated_wavs[i, : v.size(0)] = v
+
+        batch = {
+            "key": [s["key"] for s in samples],
+            "wavs": collated_wavs,
+            "wavs_length": torch.tensor([len(wav) for wav in wavs]),
+            "label": torch.tensor([s["label"] for s in samples])
+        }
+        return batch
+
+class DiskWavDataset(torch.utils.data.Dataset):
+    def __init__(self, datadir, label2id, label_file="utt2lang"):
+        
+        self.utt2label = {}
+        self.label2id = label2id
+
+        for l in open(f"{datadir}/{label_file}"):
+            ss = l.split()
+            if label2id is not None:
+                self.utt2label[ss[0]] = label2id[ss[1]]
+            else:
+                self.utt2label[ss[0]] = 0
+
+        self.wavs = {}
+        logging.info(f"Reading wav locations from {datadir}/wav.scp")
+        num_lines = sum(1 for line in open(f"{datadir}/wav.scp"))
+        pbar = tqdm(total=num_lines)
+        self.keys = []
+        for l in open(f"{datadir}/wav.scp"):
+            key, filename = l.split()
+            self.keys.append(key)
+            self.wavs[key] = filename
+            pbar.update(1)
+
+        pbar.close()
+        logging.info("Reading wav locations finished")
+
+    def __len__(self):
+        return len(self.wavs)
+
+    def __getitem__(self, index):
+        key = self.keys[index]
+        wav_tensor = torchaudio.load(self.wavs[key], normalization=1 << 31)[0]
+        assert wav_tensor.shape[0] == 1
+
+        return {"key": key, 
+                "wavs": wav_tensor[0],
                 "label": self.utt2label[key]}
 
     def collater(self, samples):
