@@ -36,7 +36,6 @@ def nll_loss_with_label_smoothing(inputs, target, smooth_eps=None):
 
     if smooth_eps < EPSILON:
         return F.nll_loss(inputs, target)
-    #breakpoint()
 
     num_classes = inputs.size(-1)
 
@@ -104,37 +103,11 @@ class SEBasicBlock(nn.Module):
 
         return out
 
-class GatingModel(nn.Module):
-
-    def __init__(self, input_dim):
-        super(GatingModel, self).__init__()
-        self.batchnorm = nn.BatchNorm1d(input_dim)
-        self.rnn = nn.GRU(input_dim, 100, batch_first=True, bidirectional=True, num_layers=1)
-        self.fc = nn.Linear(200, 1)
-
-    def forward(self, x):
-        x = self.batchnorm(x).permute(0, 2, 1).contiguous()
-        x, _ = self.rnn(x)
-        result = F.sigmoid(self.fc(x))    
-        return result.reshape(x.shape[0], -1)
-
-
 class CMN(nn.Module):
 
     def forward(self, x):
         return x - torch.mean(x, dim=2).unsqueeze(2)
 
-
-class WeightedStatisticalPooling(nn.Module):
-
-    def forward(self, x, weights):
-        # x is 3-D with axis [B, feats, T]
-        weights_sum = weights.sum(dim=-1).view(weights.shape[0], 1, 1)
-        mu = (x * weights.unsqueeze(1)).sum(dim=-1, keepdim=True) / weights_sum
-        std = ((((x - mu)**2) * weights.unsqueeze(1)).sum(dim=-1, keepdim=True) / weights_sum  + EPSILON).sqrt()
-        result = torch.cat((mu, std), dim=1).squeeze(-1)
-
-        return result
 
 
 class StatisticalPooling(nn.Module):
@@ -207,8 +180,8 @@ class XVectorModel(LightningModule):
         self.speed_perturbation = transforms.SpeedPerturbation()
 
         self.transforms = [
-            transforms.Reverberate(rir_list_filename="local/real_and_sim_rirs.wavs.txt"),
-            transforms.AddNoise(noise_list_filename="local/musan.100.wavs.txt"),
+            transforms.Reverberate(rir_list_filename=hparams.rir_list),
+            transforms.AddNoise(noise_list_filename=hparams.noise_list),
             transforms.WhiteNoise(),
         ]
 
@@ -283,9 +256,6 @@ class XVectorModel(LightningModule):
             self.attention_pooling_layer = SelfAttentionPooling(dim=hidden_dim, attention_dim=self.hparams.attention_dim, num_heads=self.hparams.num_attention_heads)
             self.pooling_layer = self.attention_pooling_layer
             current_input_dim = hidden_dim * self.hparams.num_attention_heads
-        elif self.hparams.use_gating_branch:
-            self.gating_model = GatingModel(self.hparams.num_fbanks)
-            self.pooling_layer = WeightedStatisticalPooling()
         else:
             self.pooling_layer = StatisticalPooling()
         
@@ -306,11 +276,10 @@ class XVectorModel(LightningModule):
         post_pooling_layers.append(linear)
 
         post_pooling_layers.append(nn.LogSoftmax(dim=1))
-
         
         self.post_pooling_layers = nn.Sequential(*post_pooling_layers)
 
-        
+       
         #print(self.model)
         #from torchsummary import summary
         #summary(self.model, input_size=(self.feat_dim, 300), device="cpu")
@@ -339,14 +308,7 @@ class XVectorModel(LightningModule):
         else:
             pre_pooling_output = self.pre_pooling_layers(x)
 
-        if self.hparams.use_gating_branch:
-            self.gating_model.rnn.flatten_parameters()
-            gating_output = self.gating_model(x)
-            #breakpoint()
-            pooling_output = self.pooling_layer(pre_pooling_output, gating_output)
-            return pooling_output
-        else:
-            return self.pooling_layer(pre_pooling_output)
+        return self.pooling_layer(pre_pooling_output)
 
     def wav_to_features(self, x):
         with torch.no_grad():
@@ -371,7 +333,7 @@ class XVectorModel(LightningModule):
         x, y = batch
         with torch.no_grad():
             if random.random() < self.hparams.speed_perturbation_probability:
-                x = self.speed_perturbation(x).to(x.device)
+                x = self.speed_perturbation(x)
         
         if self.hparams.augmix_lambda > EPSILON:
             x_aug_1 = torch.zeros_like(x)
@@ -380,6 +342,14 @@ class XVectorModel(LightningModule):
                 for i in range(len(x)):
                     x_aug_1[i] = transforms.augment_and_mix(self.transforms, x[i])
                     x_aug_2[i] = transforms.augment_and_mix(self.transforms, x[i])
+                    
+            if torch.isnan(x_aug_1).any():
+                logging.warn("NaN in input detected. Replacing it with 0.")
+                x_aug_1 = x.masked_fill(torch.isnan(x_aug_1), 0)
+            if torch.isnan(x_aug_2).any():
+                logging.warn("NaN in input detected. Replacing it with 0.")
+                x_aug_2 = x.masked_fill(torch.isnan(x_aug_2), 0)
+
         else:
             with torch.no_grad():
                 for i in range(len(x)):
@@ -387,6 +357,10 @@ class XVectorModel(LightningModule):
                         x[i] = transforms.random_augment(self.transforms, x[i])
                     else:    
                         x[i] = transforms.augment_and_mix(self.transforms, x[i])
+
+        if torch.isnan(x).any():
+            logging.warn("NaN in input detected. Replacing it with 0.")
+            x = x.masked_fill(torch.isnan(x), 0)
 
         y_hat = self.forward(self.wav_to_features(x))
 
@@ -624,7 +598,7 @@ class XVectorModel(LightningModule):
         parser.add_argument('--conv-dilations', default="1,2,3,1,1")
         parser.add_argument('--hidden-dim', default=512, type=int)
         parser.add_argument('--pre-pooling-hidden-dim', default=1500, type=int)
-        parser.add_argument('--learning-rate', default=0.003, type=float)
+        parser.add_argument('--learning-rate', default=0.0005, type=float)
 
         # use attention instead of stats pooling?
         parser.add_argument('--use-attention', default=False, type=bool)
@@ -633,9 +607,6 @@ class XVectorModel(LightningModule):
         parser.add_argument('--attention-diversity-penalty-lambda', default=0.01, type=float)
 
         parser.add_argument('--augmix-lambda', default=12.0, type=float)
-
-        # use a dedicated gating branch before pooling
-        parser.add_argument('--use-gating-branch', default=False, type=bool)
 
         parser.add_argument('--use-resnet', default=False, type=bool)
 
@@ -654,6 +625,9 @@ class XVectorModel(LightningModule):
 
         parser.add_argument('--label-smoothing', default=0.0, type=float)
 
+        parser.add_argument('--rir-list', default="local/rir-list.txt", type=str)
+        parser.add_argument('--noise-list', default="local/noise-list.txt", type=str)
+
         parser.add_argument(
             '--extract-xvectors-datadir',
             type=str,
@@ -666,7 +640,6 @@ class XVectorModel(LightningModule):
             default=False,
             help='Apply augmix to input data when extracting x-vectors'
         )
-
 
         parser.add_argument(
             '--dump-xvectors-dir',
