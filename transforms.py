@@ -141,6 +141,7 @@ class Noop(nn.Module):
 
 class FreqMask(nn.Module):
     def __init__(self, max_masked_freqs=5, num_masks=1, replace_with_zero=False):
+        super(FreqMask, self).__init__()
         self.replace_with_zero = replace_with_zero
         self.num_masks = num_masks
         self.max_masked_freqs = max_masked_freqs

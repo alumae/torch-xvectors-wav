@@ -20,33 +20,6 @@ from data import DiskWavDataset
 #torch.manual_seed(SEED)
 #np.random.seed(SEED)
 
-def extract_xvectors(trainer, model, extract_xvectors_datadir, store_xvectors_dir, utt2class):
-    #model = trainer.get_model()
-    breakpoint()
-    model.zero_grad()
-    model.eval()
-    torch.set_grad_enabled(False)
-    dataset = DiskWavDataset(datadir=extract_xvectors_datadir, label2id=None, label_file=utt2class)
-    dist_sampler = None
-    if trainer.use_ddp:
-        dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    dataloader = torch.utils.data.DataLoader(dataset=dataset, sampler=dist_sampler,
-        batch_size=1, #self.hparams.batch_size, 
-        collate_fn=dataset.collater,
-        num_workers=2)
-
-    for batch_idx, batch in enumerate(dataloader):
-
-        if trainer.single_gpu:
-            # for single GPU put inputs on gpu manually
-            root_gpu = 0
-            if isinstance(trainer.data_parallel_device_ids, list):
-                root_gpu = trainer.data_parallel_device_ids[0]
-            batch = trainer.transfer_batch_to_gpu(batch, root_gpu)
-        x = batch["wavs"]
-        output = model.extract_xvectors(model.wav_to_features(x))
-
-
 
 def main(hparams):
     """
@@ -89,7 +62,7 @@ def main(hparams):
     # ------------------------
     # 3 START TRAINING
     # ------------------------
-    if (hparams.extract_xvectors_datadir is None):
+    if (hparams.extract_xvectors_datadir is None and hparams.test_datadir is None):
         trainer.fit(model)
     else:
         trainer.test(model)

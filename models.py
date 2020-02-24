@@ -185,6 +185,10 @@ class XVectorModel(LightningModule):
             transforms.WhiteNoise(),
         ]
 
+        self.feature_transforms = [
+            transforms.FreqMask()
+        ]
+
         # For dumping x-vectors
         self.write_helper = None
 
@@ -223,7 +227,7 @@ class XVectorModel(LightningModule):
                 nn.BatchNorm2d(64, momentum=bn_momentum),
                 nn.ReLU(inplace=True))
 
-            self.resnet = torchvision.models.ResNet(SEBasicBlock, [2, 2, 2, 2])
+            self.resnet = torchvision.models.ResNet(SEBasicBlock, [int(i.strip()) for i in self.hparams.resnet_layers.split(",")])
             # FIXME: kernel_size depends on num_fbanks
             self.post_resnet =  nn.Sequential(
                 nn.Conv2d(512, self.hparams.pre_pooling_hidden_dim, kernel_size=(4,1),  bias=False),
@@ -362,7 +366,12 @@ class XVectorModel(LightningModule):
             logging.warn("NaN in input detected. Replacing it with 0.")
             x = x.masked_fill(torch.isnan(x), 0)
 
-        y_hat = self.forward(self.wav_to_features(x))
+        x_features = self.wav_to_features(x)
+        if self.hparams.spec_augment:
+            with torch.no_grad():
+                for i in range(len(x)):
+                    x_features[i] = transforms.augment_and_mix(self.feature_transforms, x_features[i])
+        y_hat = self.forward(x_features)
 
         # calculate loss
         loss_val = self.loss(y, y_hat, smooth_eps=self.hparams.label_smoothing)
@@ -485,22 +494,28 @@ class XVectorModel(LightningModule):
 
     def test_step(self, batch, batch_idx):
         x = batch["wavs"]
-        
-        if self.hparams.augmix_xvectors:
-            for i in range(len(x)):
-                if self.hparams.use_simple_augment:
-                    x[i] = transforms.random_augment(self.transforms, x[i])
-                else:    
-                    x[i] = transforms.augment_and_mix(self.transforms, x[i])
+        if self.hparams.dump_xvectors_dir is not None:
+            if self.hparams.augmix_xvectors:
+                for i in range(len(x)):
+                    if self.hparams.use_simple_augment:
+                        x[i] = transforms.random_augment(self.transforms, x[i])
+                    else:    
+                        x[i] = transforms.augment_and_mix(self.transforms, x[i])
 
-        xvectors = self.extract_xvectors(self.wav_to_features(x))
+            xvectors = self.extract_xvectors(self.wav_to_features(x))
 
-        if self.write_helper is None and self.hparams.dump_xvectors_dir is not None:            
-            self.write_helper = WriteHelper(f'ark,scp:{self.hparams.dump_xvectors_dir}/xvector.ark,{self.hparams.dump_xvectors_dir}/xvector.scp')
-        if self.write_helper:
-            for i in range(len(xvectors)):
-                self.write_helper(batch["key"][i], xvectors[i].cpu().numpy())
-
+            if self.write_helper is None and self.hparams.dump_xvectors_dir is not None:            
+                self.write_helper = WriteHelper(f'ark,scp:{self.hparams.dump_xvectors_dir}/xvector.ark,{self.hparams.dump_xvectors_dir}/xvector.scp')
+            if self.write_helper:
+                for i in range(len(xvectors)):
+                    self.write_helper(batch["key"][i], xvectors[i].cpu().numpy())
+        elif self.hparams.test_datadir is not None:
+            y_hat = self.forward(self.wav_to_features(x))
+            if self.write_helper is None and self.hparams.dump_posteriors_file is not None:            
+                self.write_helper = WriteHelper(f'ark,t:{self.hparams.dump_posteriors_file}')
+            if self.write_helper:
+                for i in range(len(y_hat)):
+                    self.write_helper(batch["key"][i], y_hat[i].cpu().numpy())
 
         output = OrderedDict({
         })
@@ -564,8 +579,8 @@ class XVectorModel(LightningModule):
 
     @pl.data_loader
     def test_dataloader(self):
-        if self.hparams.extract_xvectors_datadir is not None:
-            dataset = DiskWavDataset(datadir=self.hparams.extract_xvectors_datadir, label2id=None, label_file=self.hparams.utt2class)
+        if self.hparams.test_datadir is not None:
+            dataset = DiskWavDataset(datadir=self.hparams.test_datadir, label2id=self.chunk_dataset_factory.label2id, label_file=self.hparams.utt2class)
             dist_sampler = None
             if self.trainer.use_ddp:
                 dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
@@ -609,6 +624,7 @@ class XVectorModel(LightningModule):
         parser.add_argument('--augmix-lambda', default=12.0, type=float)
 
         parser.add_argument('--use-resnet', default=False, type=bool)
+        parser.add_argument('--resnet-layers', default="2,2,2,2", type=str)
 
         parser.add_argument('--speed-perturbation-probability', default=0.5, type=float)
 
@@ -617,6 +633,7 @@ class XVectorModel(LightningModule):
         # data
         parser.add_argument('--datadir', required=True, type=str)       
         parser.add_argument('--dev-datadir', required=True, type=str)
+        parser.add_argument('--test-datadir', required=False, type=str)        
         parser.add_argument('--utt2class', default="utt2lang", type=str)
 
         # training params (opt)
@@ -627,6 +644,8 @@ class XVectorModel(LightningModule):
 
         parser.add_argument('--rir-list', default="local/rir-list.txt", type=str)
         parser.add_argument('--noise-list', default="local/noise-list.txt", type=str)
+
+        parser.add_argument('--spec-augment', default=False, type=bool)
 
         parser.add_argument(
             '--extract-xvectors-datadir',
@@ -647,5 +666,14 @@ class XVectorModel(LightningModule):
             default=None,
             help='Directory to store xvectors in'
         )
+
+        parser.add_argument(
+            '--dump-posteriors-file',
+            type=str,
+            default=None,
+            help='File for storing posteriors of test data'
+        )
+
+
 
         return parser
