@@ -30,6 +30,8 @@ def main(hparams):
     # 1 INIT LIGHTNING MODEL
     # ------------------------
 
+    
+
     model = XVectorModel(hparams)
 
         
@@ -47,12 +49,13 @@ def main(hparams):
     # 2 INIT TRAINER
     # ------------------------
     trainer = Trainer(
-        logger=(hparams.extract_xvectors_datadir is None),
+        logger=(hparams.test_datadir is None),
         weights_summary=None,
         gpus=hparams.gpus,
         distributed_backend=hparams.distributed_backend,
         early_stop_callback=early_stop_callback,
         max_epochs=hparams.max_num_epochs,
+        min_epochs=hparams.min_num_epochs,
         resume_from_checkpoint=hparams.resume_checkpoint,
         gradient_clip_val=hparams.gradient_clip_val
         #train_percent_check=0.002,
@@ -62,7 +65,7 @@ def main(hparams):
     # ------------------------
     # 3 START TRAINING
     # ------------------------
-    if (hparams.extract_xvectors_datadir is None and hparams.test_datadir is None):
+    if ((hparams.extract_xvectors_datadir is None and hparams.dump_posteriors_file is None) and hparams.test_datadir is None):
         trainer.fit(model)
     else:
         trainer.test(model)
@@ -76,7 +79,7 @@ if __name__ == '__main__':
     # ------------------------
     # these are project-wide arguments
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-    mp.set_start_method('fork')
+    #mp.set_start_method('fork')
 
     root_dir = os.path.dirname(os.path.realpath(__file__))
     parent_parser = ArgumentParser(add_help=False)
@@ -96,10 +99,17 @@ if __name__ == '__main__':
     )
     parent_parser.add_argument(
         '--max-num-epochs', 
-        default=100, 
+        default=200, 
         type=int, 
         metavar='N',
         help='max number of total epochs to run')
+
+    parent_parser.add_argument(
+        '--min-num-epochs', 
+        default=50, 
+        type=int, 
+        metavar='N',
+        help='min number of total epochs to run')
 
     parent_parser.add_argument(
         '--resume-checkpoint',

@@ -12,13 +12,14 @@ from tqdm import tqdm
 
 class WavChunkDataset(torch.utils.data.Dataset):
 
-    def __init__(self, outer, is_train, num_batches=None, proportion=None):
+    def __init__(self, outer, is_train, sample_rate, num_batches=None, proportion=None):
         super(WavChunkDataset, self).__init__()
         if num_batches is not None and proportion is not None:
             raise Exception(
                 "Both num_batches or proportion should not be specified")
         self.outer = outer
         self.is_train = True
+        self.sample_rate = sample_rate
         if num_batches is not None:
             self.num_batches = num_batches
         elif proportion is not None:
@@ -35,7 +36,7 @@ class WavChunkDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         chunk_length = random.uniform(
             self.outer.min_length, self.outer.max_length)
-        chunk_length_in_samples = int(chunk_length * self.outer.sample_rate)
+        chunk_length_in_samples = int(chunk_length * self.sample_rate)
         wav_tensor = torch.zeros(
             (self.outer.batch_size, chunk_length_in_samples))
         labels_tensor = torch.zeros(
@@ -62,7 +63,7 @@ class WavChunkDataset(torch.utils.data.Dataset):
                     break
 
             utt = random.choice(utts)
-            utt_wav = self.get_utt_wav(utt)
+            utt_wav = self.get_utt_wav(utt, self.sample_rate)
             start_pos = random.randint(0, len(utt_wav) - chunk_length_in_samples)
 
             utt_wav = utt_wav[start_pos:start_pos+chunk_length_in_samples]
@@ -70,8 +71,12 @@ class WavChunkDataset(torch.utils.data.Dataset):
             labels_tensor[i] = self.outer.label2id[label]
         return wav_tensor, labels_tensor
 
-    def get_utt_wav(self, utt):
-        wav_tensor = torchaudio.load(self.outer.wavs[utt], normalization=1 << 31)[0]
+    def get_utt_wav(self, utt, sample_rate):
+        wav_tensor, utt_sample_rate = torchaudio.load(self.outer.wavs[utt], normalization=1 << 31)
+        if utt_sample_rate != sample_rate:
+            wav_tensor = torchaudio.compliance.kaldi.resample_waveform(wav_tensor, utt_sample_rate, sample_rate) 
+        if (wav_tensor.shape[0] != 1):
+            wav_tensor = torch.mean(wav_tensor, dim=0, keepdim=True)
         assert wav_tensor.shape[0] == 1
         return wav_tensor[0]
 
@@ -118,19 +123,20 @@ class RandomWavChunkSubsetDatasetFactory:
         self.utt2dur = {}
         for l in open(f"{datadir}/utt2dur"):
             ss = l.split()
-            self.utt2dur[ss[0]] = float(ss[1])
+            if ss[0] in utt2label:
+                self.utt2dur[ss[0]] = float(ss[1])
         self.total_dur = sum(self.utt2dur.values())
-        _, self.sample_rate = torchaudio.load(list(self.wavs.values())[0], normalization=1 << 31)
 
 
-    def get_chunk_dataset(self, is_train, num_batches=None, proportion=None):
-        return WavChunkDataset(self, is_train=True, num_batches=num_batches, proportion=proportion)
 
-    def get_train_dataset(self, num_batches=None, proportion=None):
-        return self.get_chunk_dataset(is_train=True, num_batches=num_batches, proportion=proportion)
+    def get_chunk_dataset(self, is_train, sample_rate, num_batches=None, proportion=None):
+        return WavChunkDataset(self, is_train=True, sample_rate=sample_rate, num_batches=num_batches, proportion=proportion)
 
-    def get_valid_dataset(self, num_batches):
-        return self.get_chunk_dataset(is_train=False, num_batches=num_batches)
+    def get_train_dataset(self, sample_rate, num_batches=None, proportion=None):
+        return self.get_chunk_dataset(is_train=True, sample_rate=sample_rate, num_batches=num_batches, proportion=proportion)
+
+    def get_valid_dataset(self, sample_rate, num_batches):
+        return self.get_chunk_dataset(is_train=False, sample_rate=sample_rate, num_batches=num_batches)
 
 
 '''
@@ -196,7 +202,7 @@ class FastRandomChunkSubsetDatasetFactory:
 
 
 class WavSegmentDataset(torch.utils.data.Dataset):
-    def __init__(self, datadir, label2id, label_file="utt2lang"):
+    def __init__(self, datadir, sample_rate, label2id, label_file="utt2lang"):
         
         self.utt2label = {}
         self.label2id = label2id
@@ -212,10 +218,14 @@ class WavSegmentDataset(torch.utils.data.Dataset):
         self.keys = []
         for l in open(f"{datadir}/wav.scp"):
             key, filename = l.split()
-            self.keys.append(key)
-            wav_tensor = torchaudio.load(filename, normalization=1 << 31)[0]
-            assert wav_tensor.shape[0] == 1
-            self.wavs[key] = wav_tensor[0]
+            if key in self.utt2label:
+                self.keys.append(key)
+                wav_tensor, utt_sample_rate = torchaudio.load(filename, normalization=1 << 31)
+                if utt_sample_rate != sample_rate:
+                    wav_tensor = torchaudio.compliance.kaldi.resample_waveform(wav_tensor, utt_sample_rate, sample_rate) 
+                if (wav_tensor.shape[0] != 1):
+                    wav_tensor = torch.mean(wav_tensor, dim=0, keepdim=True)
+                self.wavs[key] = wav_tensor[0]
             pbar.update(1)
 
         pbar.close()
@@ -262,10 +272,11 @@ class WavSegmentDataset(torch.utils.data.Dataset):
         return batch
 
 class DiskWavDataset(torch.utils.data.Dataset):
-    def __init__(self, datadir, label2id, label_file="utt2lang"):
+    def __init__(self, datadir, sample_rate, label2id, label_file="utt2lang"):
         
         self.utt2label = {}
         self.label2id = label2id
+        self.sample_rate = sample_rate
 
         for l in open(f"{datadir}/{label_file}"):
             ss = l.split()
@@ -281,8 +292,9 @@ class DiskWavDataset(torch.utils.data.Dataset):
         self.keys = []
         for l in open(f"{datadir}/wav.scp"):
             key, filename = l.split()
-            self.keys.append(key)
-            self.wavs[key] = filename
+            if key in self.utt2label:
+                self.keys.append(key)            
+                self.wavs[key] = filename
             pbar.update(1)
 
         pbar.close()
@@ -293,8 +305,12 @@ class DiskWavDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         key = self.keys[index]
-        wav_tensor = torchaudio.load(self.wavs[key], normalization=1 << 31)[0]
-        assert wav_tensor.shape[0] == 1
+        wav_tensor, utt_sample_rate = torchaudio.load(self.wavs[key], normalization=1 << 31)
+        if utt_sample_rate != self.sample_rate:
+            wav_tensor = torchaudio.compliance.kaldi.resample_waveform(wav_tensor, utt_sample_rate, self.sample_rate) 
+
+        if (wav_tensor.shape[0] != 1):
+            wav_tensor = torch.mean(wav_tensor, dim=0, keepdim=True)
 
         return {"key": key, 
                 "wavs": wav_tensor[0],

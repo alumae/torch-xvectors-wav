@@ -27,8 +27,34 @@ import transforms
 
 from kaldiio import WriteHelper
 
-
 EPSILON = torch.tensor(torch.finfo(torch.float).eps)
+
+def max_outlier_loss(labels, logits, alpha):
+    #breakpoint()
+    losses = F.nll_loss(logits, labels, reduction='none')
+    outlier_mask = losses >= alpha * losses.max()
+    outlier_idx = (outlier_mask == 0).nonzero().squeeze(1)
+
+    loss = losses[outlier_idx].mean()
+
+    return loss
+
+
+def lsoft_loss(labels, logits, beta):
+
+    labels_one_hot = F.one_hot(labels, logits.size(-1))
+
+    output = torch.exp(logits)
+    output = torch.clamp(output, EPSILON, 1)
+
+    labels_update = beta * labels_one_hot + (1 - beta) * output
+
+    losses = -torch.sum(labels_update * logits, dim=-1)
+
+    loss = losses.mean()
+
+    return loss
+
 
 def nll_loss_with_label_smoothing(inputs, target, smooth_eps=None):
     assert inputs.shape[0] == target.shape[0]
@@ -46,6 +72,18 @@ def nll_loss_with_label_smoothing(inputs, target, smooth_eps=None):
     loss = -(eps_nll * likelihood + eps_sum * inputs.sum(-1)).mean(0)
 
     return loss
+
+
+# http://openaccess.thecvf.com/content_ICCV_2019/papers/Wang_Symmetric_Cross_Entropy_for_Robust_Learning_With_Noisy_Labels_ICCV_2019_paper.pdf
+def reverse_nll_loss(inputs, target, log0):
+    lin_inputs = inputs.exp()
+    
+    num_classes = inputs.size(-1)
+    target_rev_nll = lin_inputs.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+    result = (log0 * lin_inputs).sum(-1) - log0 * target_rev_nll
+
+    return -(result.mean())
+
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -135,6 +173,7 @@ class SelfAttentionPooling(nn.Module):
 
     def forward(self, x):        
         # put head dimension in front
+        #breakpoint()
         a =  torch.clamp(F.softmax(self.w2(F.relu(self.w1(x))), dim=-1), 1e-7, 1).permute(1, 0, 2).unsqueeze(2)
         mu = (x * a).sum(dim=-1, keepdim=True)
         std = ((((x - mu)**2) * a).sum(dim=-1, keepdim=True) + 1e-7).sqrt()
@@ -168,6 +207,10 @@ class XVectorModel(LightningModule):
         super(XVectorModel, self).__init__()
         self.hparams = hparams
 
+        if sum([self.hparams.reverse_ce_alpha > EPSILON, self.hparams.label_smoothing > EPSILON, 
+                self.hparams.lsoft_beta != 1.0, self.hparams.max_outlier_alpha != 1.0]) > 1:
+            raise Error("Several of  [--lsoft-beta --max.outlier-alpha  --reverse-ce-alpha --label-smoothing] specified, cannot use more than one")
+
         self.batch_size = hparams.batch_size
 
         self.chunk_dataset_factory = RandomWavChunkSubsetDatasetFactory(hparams.datadir, 
@@ -179,14 +222,15 @@ class XVectorModel(LightningModule):
 
         self.speed_perturbation = transforms.SpeedPerturbation()
 
-        self.transforms = [
-            transforms.Reverberate(rir_list_filename=hparams.rir_list),
-            transforms.AddNoise(noise_list_filename=hparams.noise_list),
-            transforms.WhiteNoise(),
-        ]
+        if not self.hparams.no_data_augment:
+            self.transforms = [
+                transforms.Reverberate(rir_list_filename=hparams.rir_list, sample_rate=self.hparams.sample_rate),
+                transforms.AddNoise(noise_list_filename=hparams.noise_list, sample_rate=self.hparams.sample_rate),
+                transforms.WhiteNoise(),
+            ]
 
         self.feature_transforms = [
-            transforms.FreqMask()
+            transforms.FreqMask(replace_with_zero=True)
         ]
 
         # For dumping x-vectors
@@ -197,6 +241,14 @@ class XVectorModel(LightningModule):
 
         # build model
         self.__build_model()
+
+        if hparams.load_pretrained_model is not None:
+            logging.info(f"Loading pretraine model (without the final layer) from {hparams.load_pretrained_model}")
+            checkpoint = torch.load(hparams.load_pretrained_model)
+            del checkpoint['state_dict']["post_pooling_layers.6.weight"]
+            del checkpoint['state_dict']["post_pooling_layers.6.bias"]
+            self.load_state_dict(checkpoint['state_dict'], strict=False)
+
 
     # ---------------------
     # MODEL SETUP
@@ -210,9 +262,9 @@ class XVectorModel(LightningModule):
 
         feature_extractor_layers = []
         feature_extractor_layers.append(torchaudio.transforms.MelSpectrogram(
-            sample_rate=self.chunk_dataset_factory.sample_rate,
-            win_length=int(self.chunk_dataset_factory.sample_rate * 0.025),
-            hop_length=int(self.chunk_dataset_factory.sample_rate * 0.01),
+            sample_rate=self.hparams.sample_rate,
+            win_length=int(self.hparams.sample_rate * 0.025),
+            hop_length=int(self.hparams.sample_rate * 0.01),
             f_min=20.0,
             n_mels=self.hparams.num_fbanks))
         
@@ -228,9 +280,12 @@ class XVectorModel(LightningModule):
                 nn.ReLU(inplace=True))
 
             self.resnet = torchvision.models.ResNet(SEBasicBlock, [int(i.strip()) for i in self.hparams.resnet_layers.split(",")])
-            # FIXME: kernel_size depends on num_fbanks
+            # kernel_size depends on num_fbanks
             self.post_resnet =  nn.Sequential(
-                nn.Conv2d(512, self.hparams.pre_pooling_hidden_dim, kernel_size=(4,1),  bias=False),
+                nn.Conv2d(512, 
+                    self.hparams.pre_pooling_hidden_dim, 
+                    kernel_size=((self.hparams.num_fbanks - 1) // 2 // 2 // 2 + 1, 1),  
+                    bias=False),
                 nn.BatchNorm2d(self.hparams.pre_pooling_hidden_dim, momentum=bn_momentum),
                 nn.ReLU(inplace=True))
             hidden_dim = 512
@@ -318,9 +373,18 @@ class XVectorModel(LightningModule):
         with torch.no_grad():
             return self.feature_extractor(x)
 
-    def loss(self, labels, logits, smooth_eps=0.0):
-        nll = nll_loss_with_label_smoothing(logits, labels, smooth_eps)
-        return nll
+    def loss(self, labels, logits, smooth_eps, reverse_ce_alpha, reverse_ce_log0, lsoft_beta, max_outlier_alpha):
+        if smooth_eps > EPSILON:
+            result = nll_loss_with_label_smoothing(logits, labels, smooth_eps)
+        elif reverse_ce_alpha > EPSILON:
+            result = F.nll_loss(logits, labels) + reverse_ce_alpha * reverse_nll_loss(logits, labels, reverse_ce_log0)
+        elif lsoft_beta < 1.0:
+            result = lsoft_loss(labels, logits, lsoft_beta)
+        elif max_outlier_alpha < 1.0:
+            result = max_outlier_loss(labels, logits, max_outlier_alpha)
+        else:
+            result = F.nll_loss(logits, labels)
+        return result
 
     def extract_xvectors(self, x):
         pooling_output = self._forward_until_pooling(x)
@@ -339,28 +403,29 @@ class XVectorModel(LightningModule):
             if random.random() < self.hparams.speed_perturbation_probability:
                 x = self.speed_perturbation(x)
         
-        if self.hparams.augmix_lambda > EPSILON:
-            x_aug_1 = torch.zeros_like(x)
-            x_aug_2 = torch.zeros_like(x)        
-            with torch.no_grad():
-                for i in range(len(x)):
-                    x_aug_1[i] = transforms.augment_and_mix(self.transforms, x[i])
-                    x_aug_2[i] = transforms.augment_and_mix(self.transforms, x[i])
-                    
-            if torch.isnan(x_aug_1).any():
-                logging.warn("NaN in input detected. Replacing it with 0.")
-                x_aug_1 = x.masked_fill(torch.isnan(x_aug_1), 0)
-            if torch.isnan(x_aug_2).any():
-                logging.warn("NaN in input detected. Replacing it with 0.")
-                x_aug_2 = x.masked_fill(torch.isnan(x_aug_2), 0)
+        if not self.hparams.no_data_augment:
+            if self.hparams.augmix_lambda > EPSILON:
+                x_aug_1 = torch.zeros_like(x)
+                x_aug_2 = torch.zeros_like(x)        
+                with torch.no_grad():
+                    for i in range(len(x)):
+                        x_aug_1[i] = transforms.augment_and_mix(self.transforms, x[i])
+                        x_aug_2[i] = transforms.augment_and_mix(self.transforms, x[i])
+                        
+                if torch.isnan(x_aug_1).any():
+                    logging.warn("NaN in input detected. Replacing it with 0.")
+                    x_aug_1 = x.masked_fill(torch.isnan(x_aug_1), 0)
+                if torch.isnan(x_aug_2).any():
+                    logging.warn("NaN in input detected. Replacing it with 0.")
+                    x_aug_2 = x.masked_fill(torch.isnan(x_aug_2), 0)
 
-        else:
-            with torch.no_grad():
-                for i in range(len(x)):
-                    if self.hparams.use_simple_augment:
-                        x[i] = transforms.random_augment(self.transforms, x[i])
-                    else:    
-                        x[i] = transforms.augment_and_mix(self.transforms, x[i])
+            else:
+                with torch.no_grad():
+                    for i in range(len(x)):
+                        if self.hparams.use_simple_augment:
+                            x[i] = transforms.random_augment(self.transforms, x[i])
+                        else:    
+                            x[i] = transforms.augment_and_mix(self.transforms, x[i])
 
         if torch.isnan(x).any():
             logging.warn("NaN in input detected. Replacing it with 0.")
@@ -374,7 +439,13 @@ class XVectorModel(LightningModule):
         y_hat = self.forward(x_features)
 
         # calculate loss
-        loss_val = self.loss(y, y_hat, smooth_eps=self.hparams.label_smoothing)
+        
+        loss_val = self.loss(y, y_hat, 
+            smooth_eps=self.hparams.label_smoothing,
+            reverse_ce_alpha=self.hparams.reverse_ce_alpha,
+            reverse_ce_log0=self.hparams.reverse_ce_log0,
+            lsoft_beta=self.hparams.lsoft_beta,
+            max_outlier_alpha=self.hparams.max_outlier_alpha)
 
         if torch.isnan(loss_val).any():
             logging.warn("NaN in loss detected. Setting those loss values to zero")
@@ -401,15 +472,18 @@ class XVectorModel(LightningModule):
 
             loss_val += aug_mix_loss
 
-            
-
         attention_diversity_penalty = None
         if self.hparams.use_attention and self.hparams.num_attention_heads > 1 and self.hparams.attention_diversity_penalty_lambda > EPSILON:
             attention_diversity_penalty = self.hparams.attention_diversity_penalty_lambda * self.attention_pooling_layer.get_last_penalty()
             if self.trainer.use_dp or self.trainer.use_ddp2:
                 attention_diversity_penalty = attention_diversity_penalty.unsqueeze(0)
             loss_val += attention_diversity_penalty
-        
+
+        if self.hparams.no_training:
+            loss_val = torch.tensor(0.0, requires_grad=True)            
+            if self.trainer.use_dp or self.trainer.use_ddp2:
+                loss_val = loss_val.unsqueeze(0)
+
         tqdm_dict = {'train_loss': loss_val}
         output = OrderedDict({
             'loss': loss_val,
@@ -436,13 +510,20 @@ class XVectorModel(LightningModule):
         
         y_hat = self.forward(self.wav_to_features(x))
 
-        loss_val = self.loss(y, y_hat)
+        loss_val = self.loss(y, y_hat,
+            smooth_eps=0,
+            reverse_ce_alpha=0,
+            reverse_ce_log0=0,
+            lsoft_beta=1.0,
+            max_outlier_alpha=1.0)
+        
 
         # acc
+
         labels_hat = torch.argmax(y_hat, dim=1)
         val_acc = torch.sum(y == labels_hat).item() / (len(y) * 1.0)
         val_acc = torch.tensor(val_acc)
-
+        #breakpoint()
         if self.on_gpu:
             val_acc = val_acc.cuda(loss_val.device.index)
 
@@ -502,17 +583,23 @@ class XVectorModel(LightningModule):
                     else:    
                         x[i] = transforms.augment_and_mix(self.transforms, x[i])
 
-            xvectors = self.extract_xvectors(self.wav_to_features(x))
+            x_features = self.wav_to_features(x)
+            if self.hparams.spec_augment:
+                with torch.no_grad():
+                    for i in range(len(x)):
+                        x_features[i] = transforms.augment_and_mix(self.feature_transforms, x_features[i])
+
+            xvectors = self.extract_xvectors(x_features)
 
             if self.write_helper is None and self.hparams.dump_xvectors_dir is not None:            
                 self.write_helper = WriteHelper(f'ark,scp:{self.hparams.dump_xvectors_dir}/xvector.ark,{self.hparams.dump_xvectors_dir}/xvector.scp')
             if self.write_helper:
                 for i in range(len(xvectors)):
                     self.write_helper(batch["key"][i], xvectors[i].cpu().numpy())
-        elif self.hparams.test_datadir is not None:
+        elif self.hparams.dump_posteriors_file is not None:
             y_hat = self.forward(self.wav_to_features(x))
             if self.write_helper is None and self.hparams.dump_posteriors_file is not None:            
-                self.write_helper = WriteHelper(f'ark,t:{self.hparams.dump_posteriors_file}')
+                self.write_helper = WriteHelper(f'ark:{self.hparams.dump_posteriors_file}')
             if self.write_helper:
                 for i in range(len(y_hat)):
                     self.write_helper(batch["key"][i], y_hat[i].cpu().numpy())
@@ -554,7 +641,7 @@ class XVectorModel(LightningModule):
     
     #@pl.data_loader -- we want it to be called every epoch
     def train_dataloader(self):
-        dataset = self.chunk_dataset_factory.get_train_dataset(proportion=0.1)
+        dataset = self.chunk_dataset_factory.get_train_dataset(proportion=0.1, sample_rate=self.hparams.sample_rate)
         dist_sampler = None
         num_workers = 8
         if self.trainer.use_ddp:
@@ -566,7 +653,7 @@ class XVectorModel(LightningModule):
 
     @pl.data_loader
     def val_dataloader(self):
-        dataset = WavSegmentDataset(datadir=self.hparams.dev_datadir, label2id=self.chunk_dataset_factory.label2id, label_file=self.hparams.utt2class)
+        dataset = WavSegmentDataset(datadir=self.hparams.dev_datadir, label2id=self.chunk_dataset_factory.label2id, label_file=self.hparams.utt2class, sample_rate=self.hparams.sample_rate)
         dist_sampler = None
         if self.trainer.use_ddp:
             dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
@@ -580,14 +667,14 @@ class XVectorModel(LightningModule):
     @pl.data_loader
     def test_dataloader(self):
         if self.hparams.test_datadir is not None:
-            dataset = DiskWavDataset(datadir=self.hparams.test_datadir, label2id=self.chunk_dataset_factory.label2id, label_file=self.hparams.utt2class)
+            dataset = DiskWavDataset(datadir=self.hparams.test_datadir, label2id=None, label_file=self.hparams.utt2class, sample_rate=self.hparams.sample_rate)
             dist_sampler = None
             if self.trainer.use_ddp:
                 dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
             dataloader = torch.utils.data.DataLoader(dataset=dataset, sampler=dist_sampler,
                 batch_size=1, #self.hparams.batch_size, 
                 collate_fn=dataset.collater,
-                num_workers=2)
+                num_workers=8)
             return dataloader
         else:
             return None
@@ -616,19 +703,19 @@ class XVectorModel(LightningModule):
         parser.add_argument('--learning-rate', default=0.0005, type=float)
 
         # use attention instead of stats pooling?
-        parser.add_argument('--use-attention', default=False, type=bool)
+        parser.add_argument('--use-attention', default=False,  action='store_true')
         parser.add_argument('--num-attention-heads', default=2, type=int)
         parser.add_argument('--attention-dim', default=128, type=int)
         parser.add_argument('--attention-diversity-penalty-lambda', default=0.01, type=float)
 
-        parser.add_argument('--augmix-lambda', default=12.0, type=float)
+        parser.add_argument('--augmix-lambda', default=0.0, type=float)
 
-        parser.add_argument('--use-resnet', default=False, type=bool)
+        parser.add_argument('--use-resnet', default=False,  action='store_true')
         parser.add_argument('--resnet-layers', default="2,2,2,2", type=str)
 
         parser.add_argument('--speed-perturbation-probability', default=0.5, type=float)
 
-        parser.add_argument('--use-simple-augment', default=False, type=bool)
+        parser.add_argument('--use-simple-augment', default=False,  action='store_true')
 
         # data
         parser.add_argument('--datadir', required=True, type=str)       
@@ -642,10 +729,25 @@ class XVectorModel(LightningModule):
 
         parser.add_argument('--label-smoothing', default=0.0, type=float)
 
+        parser.add_argument('--reverse-ce-alpha', default=0.0, type=float)
+        parser.add_argument('--reverse-ce-log0', default=-6.0, type=float)
+
+        parser.add_argument('--lsoft-beta', default=1.0, type=float)
+
+        parser.add_argument('--max-outlier-alpha', default=1.0, type=float)
+
         parser.add_argument('--rir-list', default="local/rir-list.txt", type=str)
         parser.add_argument('--noise-list', default="local/noise-list.txt", type=str)
 
-        parser.add_argument('--spec-augment', default=False, type=bool)
+        parser.add_argument('--spec-augment', default=False,  action='store_true')
+
+        parser.add_argument('--no-data-augment', default=False,  action='store_true')
+
+        parser.add_argument('--no-training', default=False,  action='store_true')        
+
+        parser.add_argument('--sample-rate', default=16000,  type=int)
+
+        parser.add_argument('--load-pretrained-model', default=None,  type=str)
 
         parser.add_argument(
             '--extract-xvectors-datadir',
@@ -655,8 +757,7 @@ class XVectorModel(LightningModule):
         )
         parser.add_argument(
             '--augmix-xvectors',
-            type=bool,
-            default=False,
+            default=False,  action='store_true',
             help='Apply augmix to input data when extracting x-vectors'
         )
 

@@ -63,7 +63,8 @@ class Reverberate(nn.Module):
         self.retain_power = retain_power
         for l in open(rir_list_filename):
             wav, rev_sample_rate = torchaudio.load(l.strip(), normalization=1 << 31)
-            assert rev_sample_rate == sample_rate
+            if rev_sample_rate != sample_rate:
+                wav = torchaudio.compliance.kaldi.resample_waveform(wav, rev_sample_rate, sample_rate) 
             self.rirs.append(wav[0])
 
     def forward(self, x):
@@ -87,7 +88,8 @@ class AddNoise(nn.Module):
         self.max = max_lambda
         for l in open(noise_list_filename):
             wav, noise_sample_rate = torchaudio.load(l.strip(), normalization=1 << 31)
-            assert noise_sample_rate == sample_rate
+            if noise_sample_rate != sample_rate:
+                wav = torchaudio.compliance.kaldi.resample_waveform(wav, noise_sample_rate, sample_rate) 
             self.noises.append(wav[0])
 
     def forward(self, x):
